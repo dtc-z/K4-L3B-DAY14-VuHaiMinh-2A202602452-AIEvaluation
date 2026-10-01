@@ -8,17 +8,22 @@ All evaluation metrics, benchmark execution, and failure analysis remain in
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import platform
 import re
 from pathlib import Path
 from typing import Any
 
 from template import (
     BenchmarkRunner,
+    EVALUATION_VERSION,
     EvalResult,
     FailureAnalyzer,
+    PASS_THRESHOLD,
     QAPair,
     RAGASEvaluator,
+    REGRESSION_DROP_THRESHOLD,
 )
 
 
@@ -292,6 +297,38 @@ def main() -> int:
             summary,
             FailureAnalyzer(),
         )
+        golden_digest = hashlib.sha256(args.golden.resolve().read_bytes()).hexdigest()
+        actual_digest = hashlib.sha256(args.actual.resolve().read_bytes()).hexdigest()
+        core_digest = hashlib.sha256(
+            Path(__file__).with_name("template.py").read_bytes()
+        ).hexdigest()
+        adapter_digest = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+        artifact["run_metadata"] = {
+            "evaluation_version": EVALUATION_VERSION,
+            "overall_score": "arithmetic mean of faithfulness, relevance, completeness",
+            "pass_threshold": PASS_THRESHOLD,
+            "regression_drop_threshold": REGRESSION_DROP_THRESHOLD,
+            "golden_dataset_sha256": golden_digest,
+            "actual_answers_sha256": actual_digest,
+            "evaluation_core_sha256": core_digest,
+            "adapter_sha256": adapter_digest,
+            "python_version": platform.python_version(),
+            "replay_scope": (
+                "Offline scoring is reproducible for these exact input and code "
+                "hashes; regenerating answers through a hosted model may vary."
+            ),
+            "run_id": hashlib.sha256(
+                ":".join(
+                    (
+                        EVALUATION_VERSION,
+                        golden_digest,
+                        actual_digest,
+                        core_digest,
+                        adapter_digest,
+                    )
+                ).encode("utf-8")
+            ).hexdigest()[:16],
+        }
         output = args.output.expanduser().resolve()
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(

@@ -1,0 +1,10 @@
+# Optional dependencies for Exercise 3.4. Install in a dedicated environment.
+-r requirements.txt
+
+# Ragas 0.4.3 has an upstream import regression with modern
+# langchain-community. The 0.3.9 / 0.3.31 combination is the tested workaround.
+ragas==0.3.9
+langchain-community==0.3.31
+deepeval==4.2.7
+openai==2.54.0
+python-dotenv==1.2.3

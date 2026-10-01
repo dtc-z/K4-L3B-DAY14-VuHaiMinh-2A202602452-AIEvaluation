@@ -8,9 +8,11 @@ generate an answer.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
+import platform
 import re
 import time
 from collections import Counter
@@ -89,6 +91,19 @@ def _split_paragraphs(text: str) -> list[str]:
         if lines:
             paragraphs.append(re.sub(r"\s+", " ", " ".join(lines)))
     return paragraphs
+
+
+def _sha256_directory(root: Path) -> str:
+    """Hash a directory deterministically using relative names and file bytes."""
+    digest = hashlib.sha256()
+    files = sorted(path for path in root.rglob("*") if path.is_file())
+    for path in files:
+        relative_path = path.relative_to(root).as_posix()
+        digest.update(relative_path.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
 
 
 def load_corpus(corpus_dir: str | Path) -> tuple[str, list[Chunk]]:
@@ -252,14 +267,25 @@ class OpenAIGenerator:
             raise RuntimeError("OPENAI_MODEL is missing from .env")
         self.client = OpenAI(api_key=api_key)
         self.max_output_tokens = max_output_tokens
+        # Reasoning-model families (including GPT-5) reject temperature.
+        # Keep deterministic sampling for compatible models and record the
+        # effective setting in the generated artifact.
+        lowered_model = self.model.lower()
+        self.temperature: float | None = (
+            None
+            if lowered_model.startswith(("gpt-5", "o1", "o3", "o4"))
+            else 0.0
+        )
 
     def generate(self, prompt: str) -> str:
-        response = self.client.responses.create(
-            model=self.model,
-            input=prompt,
-            temperature=0,
-            max_output_tokens=self.max_output_tokens,
-        )
+        parameters: dict[str, Any] = {
+            "model": self.model,
+            "input": prompt,
+            "max_output_tokens": self.max_output_tokens,
+        }
+        if self.temperature is not None:
+            parameters["temperature"] = self.temperature
+        response = self.client.responses.create(**parameters)
         answer = response.output_text.strip()
         if not answer:
             raise RuntimeError("OpenAI returned an empty answer")
@@ -388,10 +414,11 @@ def generate_actual_answers(
             progress(message)
 
     dataset_file = Path(dataset_path).expanduser().resolve()
+    corpus_root = Path(corpus_dir).expanduser().resolve()
     notify(f"Loading golden questions: {dataset_file}")
     dataset_corpus_id, questions = _load_questions(dataset_file)
-    notify(f"Loading and indexing corpus: {Path(corpus_dir).expanduser().resolve()}")
-    assistant = DomainAssistant.from_corpus(corpus_dir, generator, top_k)
+    notify(f"Loading and indexing corpus: {corpus_root}")
+    assistant = DomainAssistant.from_corpus(corpus_root, generator, top_k)
     if assistant.corpus_id != dataset_corpus_id:
         raise ValueError(
             f"Dataset corpus_id {dataset_corpus_id!r} does not match "
@@ -426,11 +453,15 @@ def generate_actual_answers(
             notify(f"FAILED at {item['id']}; stopping the run.")
             raise
 
+        prompt = _build_prompt(item["question"], response.retrieved_chunks)
         answers.append(
             {
                 "id": item["id"],
                 "question": item["question"],
                 "actual_answer": response.actual_answer,
+                "prompt_sha256": hashlib.sha256(
+                    prompt.encode("utf-8")
+                ).hexdigest(),
                 "retrieved_contexts": [
                     {
                         "source_doc": chunk.source_doc,
@@ -458,9 +489,34 @@ def generate_actual_answers(
         "generated_at": datetime.now(UTC).isoformat(),
         "agent": {
             "name": "domain-assistant",
+            "provider": (
+                "OpenAI Responses API"
+                if isinstance(assistant.generator, OpenAIGenerator)
+                else assistant.generator.__class__.__name__
+            ),
             "model": model,
             "top_k": top_k,
             "prompt_version": "1.0",
+            "temperature": getattr(assistant.generator, "temperature", None),
+            "max_output_tokens": getattr(assistant.generator, "max_output_tokens", None),
+            "retriever": {
+                "algorithm": "BM25",
+                "k1": 1.5,
+                "b": 0.75,
+                "source_repeat_decay": SOURCE_REPEAT_DECAY,
+            },
+        },
+        "provenance": {
+            "hash_algorithm": "SHA-256",
+            "golden_dataset_sha256": hashlib.sha256(
+                dataset_file.read_bytes()
+            ).hexdigest(),
+            "corpus_sha256": _sha256_directory(corpus_root),
+            "python_version": platform.python_version(),
+            "replay_note": (
+                "Saved answers and traces support deterministic offline evaluation; "
+                "hosted model regeneration is not guaranteed to return identical text."
+            ),
         },
         "answers": answers,
     }
